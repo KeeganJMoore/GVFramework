@@ -18,7 +18,7 @@ K = mat['KR_SEREP']
 C = mat['CR_SEREP']
 f = mat['g']
 
-
+# Test Rayleigh
 startTime = '0p011'
 endTime = '2'
 Red = '10'
