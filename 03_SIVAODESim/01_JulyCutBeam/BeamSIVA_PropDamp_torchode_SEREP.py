@@ -69,7 +69,9 @@ Ast = torch.from_numpy(As).float().to(device)
 LDStore, LGStore, LMStore, LRStore = [], [], [], []
 
 # --- NEW DATA PREPARATION: Create Non-Overlapping Segments ---
+
 segment_length = 300
+
 
 def create_non_overlapping_segments(disp, vel, acc, t, seg_len):
     """Chops time series data into non-overlapping segments."""
@@ -147,6 +149,8 @@ class FeatureExtractor(nn.Module):
 class Generator(nn.Module):
     def __init__(self, Minv_mat, M_mat, K_mat, C_mat, f_vec, dof):
         super(Generator, self).__init__()
+        # We store the system matrices in the generator to avoid using global
+        # variables.
         self.Minv = Minv_mat
         self.Mt = M_mat
         self.Ct = C_mat
@@ -158,45 +162,85 @@ class Generator(nn.Module):
         cprop, cnl, knl = args
         # y has shape (num_segments, 2 * self.DOF), e.g., (42, 20)
         
-        batch_size = y.shape[0]
+        numBatches = y.shape[0]
 
+        # Extract displacements and velocities. Each of these is size (numBatches,DOF) because we
+        # simulate each batch simultaneously. 
+        
         d = y[..., :self.DOF]
         v = y[..., self.DOF:]
         d_last_dof = d[..., -1]
 
+        # Compute the nonlinear force due to the flexure
         Fnl_scalar = (knl[0] * d_last_dof + knl[1] * d_last_dof**2 + knl[2] * d_last_dof**3 +
                       knl[3] * d_last_dof**4 + knl[4] * d_last_dof**5)
 
-        F_total = self.ft.expand(batch_size, -1).clone()
+        # Create the total force vector:
+        # 1. Copy a vector of zeros to create the correct shape and expand 
+        #    it to match number of batches.
+        F_total = self.ft.expand(numBatches, -1).clone()
+        
+        # 2. Subtract the nonlinear force vector, elastic forces from stiffness
+        #    matrix, and the non-conservative forces from the damping matrix.
+        #    
+        #    We employ Einstein summation to multiply the stiffness matrix and 
+        #    displacement matrix. This operation improves performance and 
+        #    lowers memory usage. The string "ij,bj->bi" means that the first
+        #    tensor has dimensions (i,j) while the second one has dimensions 
+        #    (b,j), such that the multiplication results in a tensor of dimensions
+        #    (b,i). This is equivalent to torch.matmul(K,d.T).T, but has better
+        #    performance.
         F_total[..., -1] -= Fnl_scalar
-
         F_total -= torch.einsum("ij,bj->bi", self.Kt, d)
         F_total -= torch.einsum("ij,bj->bi", self.Ct+cprop[0]*self.Mt+cprop[1]*self.Kt, v)
 
+        # Compute the accelerations using Einstein summation just like above.
         accel = torch.einsum("ij,bj->bi", self.Minv, F_total)
+        
+        # We return the state vector of velocities and accelerations
         return torch.cat([v, accel], dim=-1)
 
     def forward(self, features, t_span, disp_initial_batch, vel_initial_batch):
         cprop, cnl, knl = features
-        batch_size = disp_initial_batch.size(0)
+        numBatches = disp_initial_batch.size(0)
 
+        # Assemble initial conditions using both displacements and velocities.
         y0 = torch.cat([disp_initial_batch, vel_initial_batch], dim=1)
+        
+        # Define the differential equation and arguments that we want to solve. 
+        # to = torchode.
         term = to.ODETerm(self.system, with_args=True)
         args = (cprop, cnl, knl)
 
-        t_eval_batched = t_span.unsqueeze(0).expand(batch_size, -1)
-        t_start_batched = t_span[0].expand(batch_size)
-        t_end_batched = t_span[-1].expand(batch_size)
-        problem = to.InitialValueProblem(y0=y0, t_eval=t_eval_batched, t_start=t_start_batched, t_end=t_end_batched)
+        # Prepare time-related inputs for the ode solver in batched format.
+        t_eval_batched = t_span.unsqueeze(0).expand(numBatches, -1) # ODE is evaluated at these times
+        t_start_batched = t_span[0].expand(numBatches) # Start time, same for every batch
+        t_end_batched = t_span[-1].expand(numBatches) # End time, same for every batch
+        
+        # Assemble all pieces into a formal IVP object that the solver can understand
+        problem = to.InitialValueProblem(y0=y0, t_eval=t_eval_batched, 
+                                         t_start=t_start_batched, t_end=t_end_batched)
 
-        step_method = to.Tsit5(term=term)
+        # Select the numerical integration algorithm. 
+        step_method = to.Tsit5(term=term) # Tsit5 is Tsistouras 5/4 method that is 
+                                          # similar to Runge-Kutta methods like in ODE45
+        
+        # Create logic for adjusting time steps by defining tolerances.
         step_size_controller = to.IntegralController(atol=1e-5, rtol=1e-4, term=term)
+        
+        # Create the final solver object. AutoDiffAdjoint allows the solver to 
+        # calculate graidents backwards through the entire integration process. 
         solver = to.AutoDiffAdjoint(step_method, step_size_controller)
+        
+        # Run the simulation, then extract the state vector and separate into 
+        # displacement and velocities
         solution = solver.solve(problem, args=args)
         y_sim_batched = solution.ys
 
         all_d = y_sim_batched[..., :self.DOF]
         all_v = y_sim_batched[..., self.DOF:]
+        
+        
 
         Fnl_scalar = (knl[0] * all_d[..., -1] + knl[1] * all_d[..., -1]**2 +
                       knl[2] * all_d[..., -1]**3 + knl[3] * all_d[..., -1]**4 +
@@ -206,6 +250,7 @@ class Generator(nn.Module):
         Fnl_vec[..., -1] = -Fnl_scalar
         K_d = torch.einsum("ij,btj->bti", self.Kt, all_d)
         C_v = torch.einsum("ij,btj->bti", self.Ct+cprop[0]*self.Mt+cprop[1]*self.Kt, all_v)
+
         F_total = self.ft.view(1, 1, -1) + Fnl_vec - K_d - C_v
         accel_gen = torch.einsum("ij,btj->bti", self.Minv, F_total)
         
@@ -225,9 +270,11 @@ class Discriminator(nn.Module):
 
 def train(num_epochs):
     for epoch in range(num_epochs):
+
         if epoch == 0:
             print(f"Epoch {epoch}/{num_epochs}")
-        # --- Single Training Step on ALL 42 segments ---
+
+        # --- Single Training Step on ALL segments ---
         
         # Generate one set of physical parameters for this epoch
         z = torch.randn(1, 1, 1, device=device)
